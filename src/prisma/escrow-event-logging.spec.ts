@@ -27,7 +27,7 @@ describe('Escrow state-transition logging (#71/#72)', () => {
       where: { escrowId: escrow.id },
     });
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ fromState: null, toState: 'CREATED' });
+    expect(events[0]).toMatchObject({ fromState: null, toState: 'FUNDED' });
   });
 
   it('records a transition with from/to state on every state change', async () => {

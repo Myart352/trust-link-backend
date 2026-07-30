@@ -354,7 +354,10 @@ export class PrismaService implements OnModuleDestroy {
     if (databaseUrl) {
       try {
         const url = new URL(databaseUrl);
-        url.searchParams.set('statement_timeout', process.env.QUERY_TIMEOUT_MS ?? '30000');
+        url.searchParams.set(
+          'statement_timeout',
+          process.env.QUERY_TIMEOUT_MS ?? '30000',
+        );
         url.searchParams.set('connect_timeout', '10');
         this.effectiveDatabaseUrl = url.toString();
       } catch {
@@ -366,8 +369,10 @@ export class PrismaService implements OnModuleDestroy {
   readonly effectiveDatabaseUrl?: string;
 
   // Issue #315: slow query logging middleware
-  private readonly slowQueryThresholdMs =
-    parseInt(process.env.SLOW_QUERY_THRESHOLD_MS ?? '500', 10);
+  private readonly slowQueryThresholdMs = parseInt(
+    process.env.SLOW_QUERY_THRESHOLD_MS ?? '500',
+    10,
+  );
 
   private readonly logger = new Logger('PrismaService');
 
@@ -384,7 +389,7 @@ export class PrismaService implements OnModuleDestroy {
     if (duration > this.slowQueryThresholdMs) {
       this.logger.warn(
         `Slow query: ${model ?? 'unknown'}.${action} took ${duration}ms ` +
-        `(threshold: ${this.slowQueryThresholdMs}ms)`,
+          `(threshold: ${this.slowQueryThresholdMs}ms)`,
       );
     }
     return result;
@@ -467,6 +472,176 @@ export class PrismaService implements OnModuleDestroy {
       const escrow = this.escrows.get(where.id);
       return Promise.resolve(escrow ? { ...escrow } : null);
     },
+    findFirst: ({
+      where,
+      orderBy,
+    }: {
+      where?: Record<string, unknown>;
+      orderBy?: Record<string, 'asc' | 'desc'>;
+    }): Promise<EscrowRecord | null> => {
+      let results = this.applyEscrowFilter([...this.escrows.values()], where);
+      if (orderBy) {
+        results = this.applyEscrowOrderBy(results, orderBy);
+      }
+      return Promise.resolve(results.length > 0 ? { ...results[0] } : null);
+    },
+    findMany: ({
+      where,
+      orderBy,
+      skip,
+      take,
+      cursor,
+    }: {
+      where?: Record<string, unknown>;
+      orderBy?:
+        Record<string, 'asc' | 'desc'> | Array<Record<string, 'asc' | 'desc'>>;
+      skip?: number;
+      take?: number;
+      cursor?: { id: string };
+    } = {}): Promise<EscrowRecord[]> => {
+      let results = this.applyEscrowFilter([...this.escrows.values()], where);
+      if (orderBy) {
+        results = this.applyEscrowOrderBy(results, orderBy);
+      }
+      if (cursor) {
+        const cursorIdx = results.findIndex((e) => e.id === cursor.id);
+        if (cursorIdx >= 0) {
+          results = results.slice(cursorIdx + (skip ?? 1));
+        }
+      } else if (skip) {
+        results = results.slice(skip);
+      }
+      if (take !== undefined) {
+        results = results.slice(0, take);
+      }
+      return Promise.resolve(results.map((e) => ({ ...e })));
+    },
+    count: ({
+      where,
+    }: {
+      where?: Record<string, unknown>;
+    } = {}): Promise<number> => {
+      const results = this.applyEscrowFilter([...this.escrows.values()], where);
+      return Promise.resolve(results.length);
+    },
+    groupBy: ({
+      by,
+      _count,
+    }: {
+      by: string[];
+      _count?: Record<string, boolean>;
+    }): Promise<Array<Record<string, unknown>>> => {
+      const groups = new Map<string, Record<string, unknown>>();
+      for (const e of this.escrows.values()) {
+        const key = by
+          .map((field) => String(e[field as keyof EscrowRecord] ?? ''))
+          .join('|');
+        if (!groups.has(key)) {
+          const entry: Record<string, unknown> = {};
+          for (const field of by) {
+            entry[field] = e[field as keyof EscrowRecord];
+          }
+          if (_count) {
+            for (const countField of Object.keys(_count)) {
+              const existingCounts = (entry._count ?? {}) as Record<
+                string,
+                number
+              >;
+              entry._count = {
+                ...existingCounts,
+                [countField]: 0,
+              };
+            }
+          }
+          groups.set(key, entry);
+        }
+        if (_count) {
+          const entry = groups.get(key)!;
+          const current = (entry._count as Record<string, number>) ?? {};
+          for (const countField of Object.keys(_count)) {
+            current[countField] = (current[countField] ?? 0) + 1;
+          }
+          entry._count = current;
+        }
+      }
+      return Promise.resolve([...groups.values()]);
+    },
+    aggregate: ({
+      _sum,
+    }: {
+      _sum?: { amount?: boolean };
+    }): Promise<{ _sum: { amount: number | null } }> => {
+      let sum = 0;
+      if (_sum?.amount) {
+        for (const e of this.escrows.values()) {
+          sum += Number(e.amount);
+        }
+      }
+      return Promise.resolve({ _sum: { amount: sum } });
+    },
+    update: ({
+      where,
+      data,
+    }: {
+      where: { id: string };
+      data: Partial<EscrowRecord>;
+    }): Promise<EscrowRecord> => {
+      assertEncryptedContact('buyerContactEmail', data.buyerContactEmail);
+      assertEncryptedContact('buyerContactPhone', data.buyerContactPhone);
+      const existing = this.escrows.get(where.id);
+      if (!existing) {
+        throw new Error(`Escrow ${where.id} not found`);
+      }
+      const updated = { ...existing, ...data, updatedAt: new Date() };
+      this.escrows.set(where.id, updated);
+      if (data.state && data.state !== existing.state) {
+        this.recordEscrowEvent(where.id, existing.state, data.state);
+      }
+      return Promise.resolve({ ...updated });
+    },
+    updateMany: ({
+      where,
+      data,
+    }: {
+      where: Record<string, unknown>;
+      data: Partial<EscrowRecord>;
+    }): Promise<{ count: number }> => {
+      let count = 0;
+      for (const [id, escrow] of this.escrows.entries()) {
+        if (this.matchesWhere(escrow, where)) {
+          this.escrows.set(id, { ...escrow, ...data, updatedAt: new Date() });
+          count++;
+        }
+      }
+      return Promise.resolve({ count });
+    },
+    deleteMany: (): Promise<{ count: number }> => {
+      const count = this.escrows.size;
+      this.escrows.clear();
+      return Promise.resolve({ count });
+    },
+  };
+
+  escrowEvent = {
+    create: ({
+      data,
+    }: {
+      data: {
+        escrowId: string;
+        fromState: EscrowState | null;
+        toState: EscrowState;
+      };
+    }): Promise<EscrowEventRecord> => {
+      const event: EscrowEventRecord = {
+        id: String(this.escrowEventId++),
+        escrowId: data.escrowId,
+        fromState: data.fromState,
+        toState: data.toState,
+        createdAt: new Date(),
+      };
+      this.escrowEvents.set(event.id, event);
+      return Promise.resolve({ ...event });
+    },
     findMany: ({
       where,
       orderBy,
@@ -484,10 +659,8 @@ export class PrismaService implements OnModuleDestroy {
               'createdAt' | 'id',
               'asc' | 'desc',
             ];
-            const left =
-              field === 'createdAt' ? a.createdAt.getTime() : a.id;
-            const right =
-              field === 'createdAt' ? b.createdAt.getTime() : b.id;
+            const left = field === 'createdAt' ? a.createdAt.getTime() : a.id;
+            const right = field === 'createdAt' ? b.createdAt.getTime() : b.id;
             const comparison = left < right ? -1 : left > right ? 1 : 0;
             if (comparison !== 0) {
               return direction === 'asc' ? comparison : -comparison;
@@ -500,6 +673,317 @@ export class PrismaService implements OnModuleDestroy {
     deleteMany: (): Promise<{ count: number }> => {
       const count = this.escrowEvents.size;
       this.escrowEvents.clear();
+      return Promise.resolve({ count });
+    },
+  };
+
+  /** Applies where filters to an array of escrow records. */
+  private applyEscrowFilter(
+    escrows: EscrowRecord[],
+    where?: Record<string, unknown>,
+  ): EscrowRecord[] {
+    if (!where) return escrows;
+    return escrows.filter((e) => this.matchesWhere(e, where));
+  }
+
+  /** Sorts an array of escrow records by the given orderBy clause. */
+  private applyEscrowOrderBy(
+    escrows: EscrowRecord[],
+    orderBy:
+      Record<string, 'asc' | 'desc'> | Array<Record<string, 'asc' | 'desc'>>,
+  ): EscrowRecord[] {
+    const clauses = Array.isArray(orderBy) ? orderBy : [orderBy];
+    return [...escrows].sort((a, b) => {
+      for (const clause of clauses) {
+        const entry = Object.entries(clause)[0];
+        const field = entry[0];
+        const direction: string = entry[1];
+        const av = a[field as keyof EscrowRecord];
+        const bv = b[field as keyof EscrowRecord];
+        const left = av instanceof Date ? av.getTime() : (av ?? '');
+        const right = bv instanceof Date ? bv.getTime() : (bv ?? '');
+        const comparison = left < right ? -1 : left > right ? 1 : 0;
+        if (comparison !== 0) {
+          return direction === 'asc' ? comparison : -comparison;
+        }
+      }
+      return 0;
+    });
+  }
+
+  /** Checks whether a record matches a where clause (supports nested operators like { lte: Date }). */
+  private matchesWhere(
+    record: Record<string, unknown>,
+    where: Record<string, unknown>,
+  ): boolean {
+    return Object.entries(where).every(([key, value]) => {
+      if (value === undefined) return true;
+      const recordValue = record[key];
+      if (
+        value !== null &&
+        typeof value === 'object' &&
+        !(value instanceof Date)
+      ) {
+        const operators = value as Record<string, unknown>;
+        if ('lte' in operators) {
+          const lte = operators.lte as Date;
+          return (
+            recordValue instanceof Date &&
+            recordValue.getTime() <= lte.getTime()
+          );
+        }
+        if ('in' in operators) {
+          const allowed = operators.in as unknown[];
+          return allowed.includes(recordValue);
+        }
+      }
+      return recordValue === value;
+    });
+  }
+
+  dispute = {
+    create: ({
+      data,
+    }: {
+      data: DisputeCreateInput;
+    }): Promise<DisputeRecord> => {
+      const now = new Date();
+      const dispute: DisputeRecord = {
+        ...data,
+        id: data.id ?? String(this.disputeId++),
+        status: data.status ?? 'OPEN',
+        resolvedAt: data.resolvedAt ?? null,
+        evidenceUrls: data.evidenceUrls ?? [],
+        description: data.description ?? '',
+        createdAt: now,
+        updatedAt: now,
+      };
+      this.disputes.set(dispute.id, dispute);
+      // Side-effect: transition the linked escrow to DISPUTED and set disputeId
+      const escrow = this.escrows.get(dispute.escrowId);
+      if (escrow) {
+        const previousState = escrow.state;
+        escrow.state = 'DISPUTED';
+        escrow.disputeId = dispute.id;
+        escrow.updatedAt = now;
+        this.recordEscrowEvent(escrow.id, previousState, 'DISPUTED');
+      }
+      return Promise.resolve({ ...dispute });
+    },
+    findUnique: ({
+      where,
+    }: {
+      where: { id: string };
+    }): Promise<DisputeRecord | null> => {
+      const dispute = this.disputes.get(where.id);
+      return Promise.resolve(dispute ? { ...dispute } : null);
+    },
+    findFirst: ({
+      where,
+    }: {
+      where: Record<string, unknown>;
+    }): Promise<DisputeRecord | null> => {
+      // Delegate to findMany so the same filtering logic applies to both
+      return this.dispute
+        .findMany({ where })
+        .then((results) => (results.length > 0 ? { ...results[0] } : null));
+    },
+    findMany: ({
+      where,
+      orderBy,
+      skip,
+      take,
+    }: {
+      where?: Record<string, unknown>;
+      orderBy?: Record<string, 'asc' | 'desc'>;
+      skip?: number;
+      take?: number;
+    } = {}): Promise<DisputeRecord[]> => {
+      let results = this.applyDisputeFilter([...this.disputes.values()], where);
+      if (orderBy) {
+        results = this.applyDisputeOrderBy(results, orderBy);
+      }
+      if (skip !== undefined) {
+        results = results.slice(skip);
+      }
+      if (take !== undefined) {
+        results = results.slice(0, take);
+      }
+      return Promise.resolve(results.map((d) => ({ ...d })));
+    },
+    count: ({
+      where,
+    }: {
+      where?: Record<string, unknown>;
+    } = {}): Promise<number> => {
+      const results = this.applyDisputeFilter(
+        [...this.disputes.values()],
+        where,
+      );
+      return Promise.resolve(results.length);
+    },
+    update: ({
+      where,
+      data,
+    }: {
+      where: { id: string };
+      data: Partial<DisputeRecord>;
+    }): Promise<DisputeRecord> => {
+      const existing = this.disputes.get(where.id);
+      if (!existing) {
+        throw new Error(`Dispute ${where.id} not found`);
+      }
+      const updated = { ...existing, ...data, updatedAt: new Date() };
+      this.disputes.set(where.id, updated);
+      return Promise.resolve({ ...updated });
+    },
+    deleteMany: (): Promise<{ count: number }> => {
+      const count = this.disputes.size;
+      this.disputes.clear();
+      return Promise.resolve({ count });
+    },
+  };
+
+  /** Applies where filters to an array of dispute records. */
+  private applyDisputeFilter(
+    disputes: DisputeRecord[],
+    where?: Record<string, unknown>,
+  ): DisputeRecord[] {
+    if (!where) return disputes;
+    return disputes.filter((d) => this.matchesWhere(d, where));
+  }
+
+  /** Sorts an array of dispute records by the given orderBy clause. */
+  private applyDisputeOrderBy(
+    disputes: DisputeRecord[],
+    orderBy: Record<string, 'asc' | 'desc'>,
+  ): DisputeRecord[] {
+    return [...disputes].sort((a, b) => {
+      const entry = Object.entries(orderBy)[0];
+      const field = entry[0];
+      const direction = entry[1];
+      const av = a[field as keyof DisputeRecord];
+      const bv = b[field as keyof DisputeRecord];
+      const left = av instanceof Date ? av.getTime() : (av ?? '');
+      const right = bv instanceof Date ? bv.getTime() : (bv ?? '');
+      const comparison = left < right ? -1 : left > right ? 1 : 0;
+      return direction === 'asc' ? comparison : -comparison;
+    });
+  }
+
+  notification = {
+    create: ({
+      data,
+    }: {
+      data: NotificationCreateInput;
+    }): Promise<NotificationRecord> => {
+      const now = new Date();
+      const notification: NotificationRecord = {
+        ...data,
+        id: data.id ?? String(this.notificationId++),
+        status: data.status ?? 'PENDING',
+        retryCount: data.retryCount ?? 0,
+        sentAt: data.sentAt ?? null,
+        failedAt: data.failedAt ?? null,
+        lastError: data.lastError ?? null,
+        providerMessageId: data.providerMessageId ?? null,
+        attemptCount: data.attemptCount ?? 0,
+        lastResponseCode: data.lastResponseCode ?? null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      this.notifications.set(notification.id, notification);
+      return Promise.resolve({ ...notification });
+    },
+    findMany: ({
+      where,
+    }: {
+      where?: Record<string, unknown>;
+    } = {}): Promise<NotificationRecord[]> => {
+      let results = [...this.notifications.values()];
+      if (where) {
+        results = results.filter((n) => this.matchesWhere(n, where));
+      }
+      return Promise.resolve(results.map((n) => ({ ...n })));
+    },
+    update: ({
+      where,
+      data,
+    }: {
+      where: { id: string };
+      data: Partial<NotificationRecord>;
+    }): Promise<NotificationRecord> => {
+      const existing = this.notifications.get(where.id);
+      if (!existing) {
+        throw new Error(`Notification ${where.id} not found`);
+      }
+      const updated = { ...existing, ...data, updatedAt: new Date() };
+      this.notifications.set(where.id, updated);
+      return Promise.resolve({ ...updated });
+    },
+    updateMany: ({
+      where,
+      data,
+    }: {
+      where: Record<string, unknown>;
+      data: Partial<NotificationRecord>;
+    }): Promise<{ count: number }> => {
+      let count = 0;
+      for (const [id, notification] of this.notifications.entries()) {
+        if (this.matchesWhere(notification, where)) {
+          this.notifications.set(id, {
+            ...notification,
+            ...data,
+            updatedAt: new Date(),
+          });
+          count++;
+        }
+      }
+      return Promise.resolve({ count });
+    },
+    deleteMany: (): Promise<{ count: number }> => {
+      const count = this.notifications.size;
+      this.notifications.clear();
+      return Promise.resolve({ count });
+    },
+  };
+
+  processedWebhookEvent = {
+    create: ({
+      data,
+    }: {
+      data: ProcessedWebhookEventRecord;
+    }): Promise<ProcessedWebhookEventRecord> => {
+      this.webhookEvents.set(data.operationId, data);
+      return Promise.resolve({ ...data });
+    },
+    findUnique: ({
+      where,
+    }: {
+      where: { operationId: string };
+    }): Promise<ProcessedWebhookEventRecord | null> => {
+      const event = this.webhookEvents.get(where.operationId);
+      return Promise.resolve(event ? { ...event } : null);
+    },
+    delete: ({
+      where,
+    }: {
+      where: { operationId: string };
+    }): Promise<ProcessedWebhookEventRecord> => {
+      const event = this.webhookEvents.get(where.operationId);
+      if (event) {
+        this.webhookEvents.delete(where.operationId);
+        return Promise.resolve({ ...event });
+      }
+      const fallback: ProcessedWebhookEventRecord = {
+        operationId: where.operationId,
+        processedAt: new Date(),
+      };
+      return Promise.resolve(fallback);
+    },
+    deleteMany: (): Promise<{ count: number }> => {
+      const count = this.webhookEvents.size;
+      this.webhookEvents.clear();
       return Promise.resolve({ count });
     },
   };
